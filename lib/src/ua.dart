@@ -180,6 +180,11 @@ class UA extends EventManager {
     _registrator.register();
   }
 
+  void reconnectNow() {
+    logger.d('reconnectNow()');
+    _socketTransport?.reconnectNow();
+  }
+
   /**
    * Unregister.
    */

@@ -84,6 +84,12 @@ class SIPUAHelper extends EventManager {
     _ua!.register();
   }
 
+  void reconnectNow() {
+    assert(_ua != null,
+        'reconnectNow called but not started, you must call start first.');
+    _ua!.reconnectNow();
+  }
+
   Future<bool> unregister([bool all = true]) async {
     if (_ua != null) {
       assert(registered, 'ERROR: you must call register first.');
@@ -625,6 +631,11 @@ class Call {
   }) {
     assert(_session != null, 'ERROR(renegotiate): rtc session is invalid!');
     _session.renegotiate(options: options, useUpdate: useUpdate, done: done);
+  }
+
+  Future<bool> restartIce({bool skipAudioGuard = false}) {
+    assert(_session != null, 'ERROR(restartIce): rtc session is invalid!');
+    return _session.restartIce(skipAudioGuard: skipAudioGuard);
   }
 
   void sendDTMF(String tones, [Map<String, dynamic>? options]) {

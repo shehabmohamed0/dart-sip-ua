@@ -120,7 +120,15 @@ class RTCSession extends EventManager implements Owner {
   // Flag to indicate PeerConnection ready for actions.
   bool _rtcReady = true;
 
+  static const Duration _iceDisconnectGracePeriod = Duration(seconds: 7);
+  static const Duration _iceRestartRetryInterval = Duration(seconds: 10);
+  static const Duration _iceRestartSignalingRetryInterval =
+      Duration(seconds: 1);
+  static const int _iceRestartMaxAttempts = 3;
+
   Timer? _iceDisconnectTimer;
+  Timer? _iceRestartRetryTimer;
+  int _iceRestartAttempts = 0;
   bool _isAttemptingIceRestart = false;
 
   // SIP Timers.
@@ -1183,11 +1191,19 @@ class RTCSession extends EventManager implements Owner {
       return false;
     }
 
-    bool? upgradeToVideo;
+    bool upgradeToVideo = false;
     try {
-      upgradeToVideo = (options['mediaConstraints']?['video'] != false ||
-              options['mediaConstraints']?['mandatory']?['video'] != null) &&
-          rtcOfferConstraints?['offerToReceiveVideo'] == null;
+      final dynamic requestedVideo =
+          mediaConstraints['video'] ?? mediaConstraints['mandatory']?['video'];
+      final dynamic offerToReceiveVideo =
+          rtcOfferConstraints?['offerToReceiveVideo'] ??
+              rtcOfferConstraints?['OfferToReceiveVideo'] ??
+              rtcOfferConstraints?['mandatory']?['offerToReceiveVideo'] ??
+              rtcOfferConstraints?['mandatory']?['OfferToReceiveVideo'];
+
+      upgradeToVideo = requestedVideo != null &&
+          requestedVideo != false &&
+          offerToReceiveVideo == null;
     } catch (e) {
       logger.w('Failed to determine upgrade to video: $e');
     }
@@ -1219,7 +1235,7 @@ class RTCSession extends EventManager implements Owner {
         'extraHeaders': options['extraHeaders']
       });
     } else {
-      if (upgradeToVideo ?? false) {
+      if (upgradeToVideo) {
         _sendVideoUpgradeReinvite(<String, dynamic>{
           'eventHandlers': handlers,
           'sdpSemantics': sdpSemantics,
@@ -1459,6 +1475,14 @@ class RTCSession extends EventManager implements Owner {
    */
   void onTransportError() {
     logger.e('onTransportError()');
+    if (_isAttemptingIceRestart) {
+      logger
+          .w('Transport error during ICE restart; waiting for SIP transport.');
+      _iceRestartRetryTimer?.cancel();
+      _iceRestartRetryTimer = null;
+      _scheduleIceRestartRetry(_iceRestartSignalingRetryInterval);
+      return;
+    }
     if (_state != RtcSessionState.terminated) {
       terminate(<String, dynamic>{
         'status_code': 500,
@@ -1540,6 +1564,9 @@ class RTCSession extends EventManager implements Owner {
     if (_state == RtcSessionState.terminated) {
       return;
     }
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
+    _resetIceRestartRecovery();
     _state = RtcSessionState.terminated;
     // Terminate RTC.
     if (_connection != null) {
@@ -1642,14 +1669,155 @@ class RTCSession extends EventManager implements Owner {
     }, Timers.TIMER_H);
   }
 
-  void _iceRestart() async {
-    Map<String, dynamic> offerConstraints = _rtcOfferConstraints ??
-        <String, dynamic>{
-          'mandatory': <String, dynamic>{},
-          'optional': <dynamic>[],
-        };
+  Future<bool> _iceRestart({bool skipAudioGuard = false}) async {
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      return false;
+    }
+
+    if (!_ua.isConnected()) {
+      logger.w('SIP transport not connected; ICE restart cannot be sent yet.');
+      return false;
+    }
+
+    try {
+      await _connection?.restartIce();
+    } catch (error) {
+      logger.w('RTCPeerConnection.restartIce() failed: ${error.toString()}');
+    }
+
+    final Map<String, dynamic> offerConstraints =
+        Map<String, dynamic>.from(_rtcOfferConstraints ?? <String, dynamic>{});
+
+    final dynamic mandatory = offerConstraints['mandatory'];
+    offerConstraints['mandatory'] = mandatory is Map
+        ? Map<String, dynamic>.from(mandatory)
+        : <String, dynamic>{};
+
+    final dynamic optional = offerConstraints['optional'];
+    offerConstraints['optional'] =
+        optional is List ? List<dynamic>.from(optional) : <dynamic>[];
+
     offerConstraints['mandatory']['IceRestart'] = true;
-    renegotiate(options: offerConstraints);
+    offerConstraints['iceRestart'] = true;
+    offerConstraints['waitForIceGatheringComplete'] = true;
+
+    final bool started = renegotiate(options: <String, dynamic>{
+      'rtcOfferConstraints': offerConstraints,
+    });
+
+    if (!started) {
+      logger
+          .w('ICE restart could not start; session is not ready to re-offer.');
+      return false;
+    }
+
+    return started;
+  }
+
+  Future<bool> restartIce({bool skipAudioGuard = false}) async {
+    if (_isAttemptingIceRestart) {
+      logger.d('ICE restart recovery already in progress.');
+      return true;
+    }
+
+    final bool started = await _iceRestart(skipAudioGuard: skipAudioGuard);
+    if (!started) {
+      _startIceRestartRecovery('proactive ICE restart');
+      return true;
+    }
+
+    return started;
+  }
+
+  void _startIceRestartRecovery(String reason) {
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      return;
+    }
+
+    if (_isAttemptingIceRestart) {
+      logger.d('ICE restart recovery already running ($reason).');
+      return;
+    }
+
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
+    _isAttemptingIceRestart = true;
+    _iceRestartAttempts = 0;
+    logger.i('Starting ICE restart recovery: $reason.');
+    _scheduleIceRestartRetry(Duration.zero);
+  }
+
+  void _scheduleIceRestartRetry(Duration delay) {
+    if (_iceRestartRetryTimer != null) return;
+
+    _iceRestartRetryTimer = Timer(delay, () async {
+      _iceRestartRetryTimer = null;
+      await _runIceRestartRecoveryAttempt();
+    });
+  }
+
+  Future<void> _runIceRestartRecoveryAttempt() async {
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      _resetIceRestartRecovery();
+      return;
+    }
+
+    final RTCIceConnectionState? iceState = _connection?.iceConnectionState;
+    if (iceState == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+        iceState == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+      logger.i('ICE recovered; canceling ICE restart recovery.');
+      _resetIceRestartRecovery();
+      return;
+    }
+
+    if (!_ua.isConnected()) {
+      logger
+          .d('SIP transport unavailable; waiting before ICE restart attempt.');
+      _scheduleIceRestartRetry(_iceRestartSignalingRetryInterval);
+      return;
+    }
+
+    if (_iceRestartAttempts >= _iceRestartMaxAttempts) {
+      logger.w('ICE restart retries exhausted.');
+      _resetIceRestartRecovery();
+      terminate(<String, dynamic>{
+        'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+        'status_code': 408,
+        'reason_phrase': 'ICE Restart Timeout'
+      });
+      return;
+    }
+
+    final int attempt = _iceRestartAttempts + 1;
+    logger.i('Sending ICE restart attempt $attempt/$_iceRestartMaxAttempts.');
+    final bool started = await _iceRestart(skipAudioGuard: true);
+    _iceRestartAttempts = attempt;
+
+    if (!started) {
+      logger.w('ICE restart attempt $attempt could not start.');
+    }
+
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      _resetIceRestartRecovery();
+      return;
+    }
+
+    _scheduleIceRestartRetry(_iceRestartRetryInterval);
+  }
+
+  void _clearIceRestartRetry() {
+    _iceRestartRetryTimer?.cancel();
+    _iceRestartRetryTimer = null;
+    _iceRestartAttempts = 0;
+  }
+
+  void _resetIceRestartRecovery() {
+    _clearIceRestartRetry();
+    _isAttemptingIceRestart = false;
   }
 
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
@@ -1667,26 +1835,23 @@ class RTCSession extends EventManager implements Owner {
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
         _iceDisconnectTimer?.cancel();
-        terminate(<String, dynamic>{
-          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
-          'status_code': 408,
-          'reason_phrase': 'ICE Connection Failed'
-        });
+        _iceDisconnectTimer = null;
+
+        _startIceRestartRecovery('ICE connection failed');
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
         logger.w('ICE Connection State Disconnected.');
         if (_iceDisconnectTimer == null && !_isAttemptingIceRestart) {
           logger.i('Starting ICE disconnect timer...');
-          _iceDisconnectTimer = Timer(const Duration(seconds: 20), () {
+          _iceDisconnectTimer = Timer(_iceDisconnectGracePeriod, () {
             logger.w('ICE disconnect timer fired!');
             if (_connection?.iceConnectionState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
                 _state != RtcSessionState.terminated &&
                 _state != RtcSessionState.canceled &&
                 !_isAttemptingIceRestart) {
-              logger.i('Attempting ICE restart after timeout...');
-              _isAttemptingIceRestart = true;
-              _iceRestart();
+              _startIceRestartRecovery(
+                  'ICE remained disconnected after grace period');
             } else {
               logger.i('ICE restart aborted (state changed during timer).');
             }
@@ -1704,7 +1869,8 @@ class RTCSession extends EventManager implements Owner {
           logger.i(
               'ICE Connection State Connected/Completed. Canceling timer/resetting flag.');
           _iceDisconnectTimer?.cancel();
-          _isAttemptingIceRestart = false;
+          _iceDisconnectTimer = null;
+          _resetIceRestartRecovery();
         } else {
           logger.i('ICE Connection State Connected/Completed.');
         }
@@ -1712,6 +1878,8 @@ class RTCSession extends EventManager implements Owner {
         // Connection closed locally, usually via _connection.close() called by terminate()
         logger.i('ICE Connection State Closed.'); // Use logger.i
         _iceDisconnectTimer?.cancel(); // Ensure timer is cancelled
+        _iceDisconnectTimer = null;
+        _resetIceRestartRecovery();
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {
@@ -1762,7 +1930,6 @@ class RTCSession extends EventManager implements Owner {
   Future<RTCSessionDescription> _createLocalDescription(
       SdpType type, Map<String, dynamic>? constraints) async {
     logger.d('createLocalDescription()');
-    _iceGatheringState ??= RTCIceGatheringState.RTCIceGatheringStateNew;
     Completer<RTCSessionDescription> completer =
         Completer<RTCSessionDescription>();
 
@@ -1771,6 +1938,16 @@ class RTCSession extends EventManager implements Owner {
           'mandatory': <String, dynamic>{},
           'optional': <dynamic>[],
         };
+    final bool waitForIceGatheringComplete =
+        constraints.remove('waitForIceGatheringComplete') == true;
+    final bool isIceRestart = constraints['iceRestart'] == true ||
+        constraints['mandatory']?['IceRestart'] == true;
+
+    if (isIceRestart || waitForIceGatheringComplete) {
+      _iceGatheringState = RTCIceGatheringState.RTCIceGatheringStateNew;
+    } else {
+      _iceGatheringState ??= RTCIceGatheringState.RTCIceGatheringStateNew;
+    }
 
     List<Future<RTCSessionDescription> Function(RTCSessionDescription)>
         modifiers = constraints['offerModifiers'] ??
@@ -1847,7 +2024,8 @@ class RTCSession extends EventManager implements Owner {
            *  Because trickle ICE is not defined in the sip protocol, the delay of
            * initiating a call to answer the call waiting will be unacceptable.
            */
-          if (ua.configuration.ice_gathering_timeout != 0) {
+          if (!waitForIceGatheringComplete &&
+              ua.configuration.ice_gathering_timeout != 0) {
             setTimeout(() => ready(), ua.configuration.ice_gathering_timeout);
           }
         }
@@ -1862,6 +2040,10 @@ class RTCSession extends EventManager implements Owner {
           'emit "peerconnection:setlocaldescriptionfailed" [error:${error.toString()}]');
       emit(EventSetLocalDescriptionFailed(exception: error));
       completer.completeError(error);
+    }
+
+    if (waitForIceGatheringComplete) {
+      setTimeout(() => ready(), 10000);
     }
 
     // Resolve right away if 'pc.iceGatheringState' is 'complete'.
@@ -2736,7 +2918,7 @@ class RTCSession extends EventManager implements Owner {
       sendRequest(SipMethod.ACK);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
 
@@ -3011,7 +3193,7 @@ class RTCSession extends EventManager implements Owner {
       _handleSessionTimersInIncomingResponse(response);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
 

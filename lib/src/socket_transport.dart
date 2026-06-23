@@ -115,6 +115,30 @@ class SocketTransport {
     return;
   }
 
+  void reconnectNow() {
+    logger.d('Transport reconnectNow()');
+
+    if (isConnected() || isConnecting()) {
+      logger.d('Transport is already connected/connecting');
+      return;
+    }
+
+    _close_requested = false;
+    _recover_attempts = 0;
+
+    if (_recovery_timer != null) {
+      clearTimeout(_recovery_timer);
+      _recovery_timer = null;
+    }
+
+    for (final SocketInfo socket in _sockets) {
+      socket.status = SocketStatus.ready;
+    }
+
+    _getSocket();
+    connect();
+  }
+
   void disconnect() {
     logger.d('Transport close()');
 
