@@ -611,6 +611,7 @@ class RTCSession extends EventManager implements Owner {
         mediaConstraints['video'] != null) {
       _localMediaStreamLocallyGenerated = true;
       try {
+        await _configureAppleAudioBeforeGetUserMedia();
         stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
         emit(EventStream(
             session: this, originator: Originator.local, stream: stream));
@@ -1669,6 +1670,24 @@ class RTCSession extends EventManager implements Owner {
     }, Timers.TIMER_H);
   }
 
+  Future<void> _configureAppleAudioBeforeGetUserMedia() async {
+    if (!WebRTC.platformIsIOS) return;
+
+    try {
+      await Helper.setAppleAudioConfiguration(AppleAudioConfiguration(
+        appleAudioCategory: AppleAudioCategory.playAndRecord,
+        appleAudioCategoryOptions: <AppleAudioCategoryOption>{
+          AppleAudioCategoryOption.defaultToSpeaker,
+          AppleAudioCategoryOption.allowBluetooth,
+        },
+        appleAudioMode: AppleAudioMode.videoChat,
+      ));
+    } catch (error) {
+      logger.w(
+          'Failed to set Apple audio configuration before getUserMedia: $error');
+    }
+  }
+
   Future<bool> _iceRestart({bool skipAudioGuard = false}) async {
     if (_state == RtcSessionState.terminated ||
         _state == RtcSessionState.canceled) {
@@ -2346,6 +2365,7 @@ class RTCSession extends EventManager implements Owner {
         logger.w('Failed to enumerate devices: $e');
       }
       if (hasCamera) {
+        await _configureAppleAudioBeforeGetUserMedia();
         MediaStream localStream =
             await navigator.mediaDevices.getUserMedia(mediaConstraints);
         if (localStream.getVideoTracks().isEmpty) {
@@ -2631,6 +2651,7 @@ class RTCSession extends EventManager implements Owner {
         mediaConstraints['video'] != null) {
       _localMediaStreamLocallyGenerated = true;
       try {
+        await _configureAppleAudioBeforeGetUserMedia();
         stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
         emit(EventStream(
             session: this, originator: Originator.local, stream: stream));
@@ -3016,6 +3037,7 @@ class RTCSession extends EventManager implements Owner {
         options['pcConfig']?['sdpSemantics'] ?? 'unified-plan';
 
     try {
+      await _configureAppleAudioBeforeGetUserMedia();
       MediaStream localStream =
           await navigator.mediaDevices.getUserMedia(mediaConstraints);
       _localMediaStreamLocallyGenerated = true;
